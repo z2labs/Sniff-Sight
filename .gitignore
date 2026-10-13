@@ -1,0 +1,34 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+*.log
+.DS_Store
+funnel_auth.txt
+*.auth
+
+# data and local secrets (never commit)
+captures/
+*.npz
+*.pcap
+*.pcapng
+*.csv
+!docs/**/*.csv
+labels.csv
+*_auth.txt
+*.key
+*.pem
+.env.*
+# environments / editors
+.venv*/
+spinel_venv/
+env/
+.idea/
+.vscode/
+# local scratch
+test_esp.py
+docs/NIGHT_NOTES.md
+*.webm
+

@@ -1,0 +1,23 @@
+Sniff-Sight
+Copyright (C) 2026 z2labs (hello [at] z2labs [dot] io)
+Licensed under the GNU General Public License v3.0 only (see LICENSE).
+
+Bundled third-party components
+------------------------------
+
+sniff_sight/firmware/  (esp_sdr.bin, bootloader/bootloader.bin,
+                        partition_table/partition-table.bin, flash_args, version.json)
+  ESP32-S3 ESP-SDR firmware binaries, build of revision
+  4128c240c92d865c7d50f4457eb07e7ed585099d (2026-10-08, profile esp32s3) of
+  https://github.com/zodoczi/esp-sdr, a fork of ESPARGOS/esp-sdr
+  (https://github.com/ESPARGOS/esp-sdr, Florian Euchner and contributors).
+  License: GPL-3.0 (as the upstream project). Corresponding source code: the
+  repository and revision above. The binaries also contain Espressif ESP-IDF
+  components (Apache-2.0 and others, see the ESP-IDF license files).
+
+sniff_sight/static/flasher.js
+  Web Serial flasher, ported from the z2-web-sdr flasher (ESP-SDR project).
+
+sniff_sight/demo/sample.json, docs/demo/
+  Demo sample recorded with Sniff-Sight on an isolated OpenThread test
+  network; device addresses replaced by synthetic ones.
