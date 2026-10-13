@@ -22,11 +22,13 @@ import threading
 import numpy as np
 import collections
 import os
+import re
+import subprocess
 import time
 from contextlib import asynccontextmanager
 from typing import Optional, Set
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 
 from .esp32_sdr import ESP32SDR, FMIN, FMAX
@@ -41,6 +43,7 @@ BAUD = int(os.environ.get("SNIFF_BAUD", "115200"))
 PUSH_HZ = float(os.environ.get("SNIFF_PUSH_HZ", "60"))
 WS_JSON = os.environ.get("SNIFF_WS_JSON") == "1"   # legacy JSON spectra (for comparison)
 LITE_HZ = float(os.environ.get("SNIFF_LITE_HZ", "25"))       # light stream: max-hold frames per second
+FRAME_TIMEOUT_S = 3.0  # no SPC1 frame for this long while streaming -> reconnect (stalled run)
 RETUNE_MIN_S = 0.35   # SPEC has no in-stream retune: at most one stop/FREQ/FOFS/SPEC per 350 ms, newest centre wins
 LITE_BINS = int(os.environ.get("SNIFF_LITE_BINS", "512"))    # light stream: max-pooled bins
 CAPTURES = os.environ.get("SNIFF_CAPTURES", DEFAULT_CAPTURES)
@@ -84,6 +87,8 @@ class SpectrumHub:
         self.last_tune = 0.0            # monotonic time of the last SPEC (re)start
         self.released = False           # COM port handed to the browser flasher
         self._release_timer = None
+        self.last_frame_t = 0.0
+        self.outq = {}                  # ws -> [latest msg, kind, Event, sender task]
 
     def _on_burst(self, rec):          # bursts thread
         if self.loop:
@@ -168,6 +173,45 @@ class SpectrumHub:
                 await self._close()
             await asyncio.sleep(2)
 
+    def _offer(self, ws, msg, kind):
+        """Hand the newest spectrum to this browser's sender task; never await the socket here.
+        A slow client (phone over Funnel, 4096 bins = 8 KB x 60/s) used to block the pump,
+        the COM port stopped being read, the S3 stalled (frames of 1000s of FFTs, CRC errors)
+        and the waterfall got banded rows. Now an unsent spectrum is simply replaced."""
+        q = self.outq.get(ws)
+        if q is None:
+            q = self.outq[ws] = [None, kind, asyncio.Event(), None]
+            q[3] = asyncio.create_task(self._sender(ws, q))
+        if q[0] is not None:
+            self.perf["ws_skipped"] += 1
+        q[0], q[1] = msg, kind
+        q[2].set()
+
+    async def _sender(self, ws, q):
+        try:
+            while True:
+                await q[2].wait()
+                q[2].clear()
+                msg, kind, q[0] = q[0], q[1], None
+                if msg is None:
+                    continue
+                await (ws.send_text(msg) if isinstance(msg, str) else ws.send_bytes(msg))
+                self.bytes_out[kind] += len(msg)
+                self.perf[kind + "_msgs"] += 1
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.clients.discard(ws)
+            self.lite.discard(ws)
+        finally:
+            if self.outq.get(ws) is q:
+                self.outq.pop(ws, None)
+
+    def drop_client(self, ws):
+        q = self.outq.pop(ws, None)
+        if q and q[3]:
+            q[3].cancel()
+
     async def _restart_due(self):
         """Settings changed. The firmware cannot retune inside a SPEC run, so a retune is
         newline -> SPECEND -> FREQ/FOFS -> SPEC. Keep streaming until RETUNE_MIN_S after the
@@ -221,9 +265,15 @@ class SpectrumHub:
         t_rate, f_rate, rate = time.monotonic(), 0, 0.0
         pf = self.perf
         t_wait = time.perf_counter()
-        async for sp in self.sdr.read_spectra_dbfs():
+        frames = self.sdr.read_spectra_dbfs().__aiter__()
+        while True:
+            try:
+                sp = await asyncio.wait_for(frames.__anext__(), FRAME_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                raise RuntimeError(f"no spectrum frame for {FRAME_TIMEOUT_S:.0f} s (stream stalled)")
             _t0 = time.perf_counter(); pf["wait_ms"] += (_t0 - t_wait) * 1e3
-            if sp.n != s["bins"]:
+            self.last_frame_t = time.time()
+            if sp.n != s["bins"] or sp.ffts <= 1:   # first frame of a run: 1 FFT with -140 holes
                 t_wait = time.perf_counter()
                 continue
             pf["frames"] += 1
@@ -260,12 +310,7 @@ class SpectrumHub:
                             pooled = acc[: acc.size // k * k].reshape(-1, k).max(axis=1) if k > 1 else acc
                             q = np.clip(np.rint((pooled + 140.0) * 2), 0, 255).astype(np.uint8)
                             cache[k] = self._binmsg(dict(meta, n=int(q.size)), q.tobytes())
-                        msg = cache[k]
-                        try:
-                            await ws.send_bytes(msg)
-                            self.bytes_out["lite"] += len(msg); pf["lite_msgs"] += 1
-                        except Exception:
-                            self.lite.discard(ws); self.clients.discard(ws)
+                        self._offer(ws, cache[k], "lite")
             full = [ws for ws in self.clients if ws not in self.lite]
             if full and now >= last_push:   # newest spectrum; the page averages. Tick schedule (not "now + period"):
                 last_push = max(last_push + period, now - period)   # frames arrive in USB/poll clumps, this keeps the mean rate
@@ -279,11 +324,7 @@ class SpectrumHub:
                     q = np.clip(np.rint((db_np + 140.0) * 100), 0, 65535).astype("<u2")   # 0.01 dB steps
                     msg = self._binmsg(dict(meta, enc="u16", n=int(q.size)), q.tobytes())
                 for ws in full:
-                    try:
-                        await (ws.send_text(msg) if WS_JSON else ws.send_bytes(msg))
-                        self.bytes_out["full"] += len(msg); pf["full_msgs"] += 1
-                    except Exception:
-                        self.clients.discard(ws)
+                    self._offer(ws, msg, "full")
             t_wait = time.perf_counter(); pf["push_ms"] += (t_wait - _t1) * 1e3
 
     async def _close(self):
@@ -342,6 +383,8 @@ class PacketHub:
         self.ch_hist = collections.deque(maxlen=5000)       # (t, sniffer channel) for PER blind detection
         self.per: Optional[PerTracker] = None
         self.per_task: Optional[asyncio.Task] = None
+        self.src_seen = {}          # source address (lower case) -> [last seen, frames], for the topology panel
+        self.last_pkt_t = 0.0
 
     def channel_at(self, t: float):
         ch = None
@@ -411,6 +454,11 @@ class PacketHub:
     def _deliver(self, pkt: dict):            # event loop
         self.total += 1
         self.per_source[pkt.get("src") or "?"] += 1
+        self.last_pkt_t = time.time()
+        if pkt.get("src"):
+            e = self.src_seen.setdefault(str(pkt["src"]).lower(), [0.0, 0])
+            e[0] = self.last_pkt_t
+            e[1] += 1
         self.per_channel[pkt.get("channel")] += 1
         self.recent.append(pkt)
         pkt["pair"] = None
@@ -604,6 +652,16 @@ HTML = r"""
     .ctl input[type=number] { width: 6rem; background: #222; color: #eee; border: 1px solid #444; }
     select, button { background: #222; color: #eee; border: 1px solid #444; padding: 2px 6px; }
     button:hover { background: #333; }
+    .topo { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .tcol { display: flex; flex-direction: column; gap: 5px; min-width: 12rem; }
+    .tn { border: 1px solid #333; border-radius: 6px; padding: 5px 9px; font-size: 12px; color: #666; background: #141414; }
+    .tn small { display: block; color: inherit; opacity: .85; font-family: monospace; word-break: break-all; }
+    .tn.on { color: #eee; border-color: #4c8; background: #12261a; }
+    .tn.rx.on { border-color: #7cf; background: #11222c; }
+    .tn.dash.on { border-color: #c8f; background: #221a2a; }
+    .tarrow { color: #888; font-size: 22px; text-align: center; }
+    .tarrow small { display: block; font-size: 11px; }
+    @media (max-width: 760px) { .topo { flex-direction: column; align-items: stretch; } .tarrow { transform: rotate(90deg); } .tarrow small { transform: rotate(-90deg); } }
     canvas { display: block; background: #000; border: 1px solid #333; width: 100%; touch-action: none; }
     #spectrum, #waterfall { cursor: grab; } #spectrum.drag, #waterfall.drag { cursor: grabbing; }
     .row2 { display: grid; grid-template-columns: 1fr 300px; gap: 10px; margin-top: 8px; }
@@ -749,6 +807,10 @@ HTML = r"""
     <div class="box"><div class="scroll" style="max-height:calc(100vh - 190px)"><table><thead><tr><th>Snippet</th><th>Time</th><th>Kind</th><th>Src</th><th>Ch</th><th>RF</th></tr></thead><tbody id="snipList"></tbody></table></div></div>
   </section>
   <section class="tab" id="tab-set">
+    <div class="box"><h3>System topology</h3><div id="topo" class="topo">Loading...</div>
+      <details style="margin-top:8px"><summary class="sub">Test nodes: names and 802.15.4 source addresses</summary><div id="topoEdit"></div>
+        <div class="ctl"><button id="topoSave">Save</button> <span id="topoMsg" class="sub"></span></div></details>
+      <div class="sub" style="margin-top:4px">Bright = active (data in the last 30 s: SDR spectra, sniffer frames, node seen as a packet source). Nodes are recognised from sniffed packets only; their serial ports are never opened.</div></div>
     <div class="box"><h3>Spectrum (ESP32-S3)</h3><div class="sub">The RF controls (centre, span, bins, gain, detector, averaging, range, stream mode) are on the Live tab, above the plot (on a phone: under the plot).</div><div id="status">Connecting...</div></div>
     <div class="box" style="margin-top:10px"><h3>Firmware (ESP32-S3 SDR)</h3>
       <div class="sub">Board: <b id="fwBoard">-</b><br>Bundled: <b id="fwBundled">-</b> <span id="fwCmp"></span></div>
@@ -756,6 +818,11 @@ HTML = r"""
       <progress id="fwProg" max="1" value="0" style="width:100%;display:none"></progress>
       <pre id="fwLog" class="sub" style="max-height:160px;overflow:auto;white-space:pre-wrap;margin:4px 0 0"></pre>
       <div class="sub" style="margin-top:4px">Flashing uses Web Serial in this browser: desktop Chrome / Edge on the PC the board is plugged into, opened via http://localhost:8000 (or https). The dashboard releases the SDR port first and reconnects when done.</div></div>
+    <div class="box" style="margin-top:10px"><h3>Silicon Labs boards (WSTK / xG24 RCP)</h3>
+      <div class="sub" id="slInfo">Checking Simplicity Commander...</div>
+      <div class="ctl" style="margin-top:6px"><label>Kit <select id="slKit"></select></label> <label>Image <select id="slFile"></select></label>
+        <button id="slFlash" style="display:none">Flash Silabs board</button> <button id="slRefresh">Refresh</button></div>
+      <pre id="slLog" class="sub" style="max-height:140px;overflow:auto;white-space:pre-wrap;margin:4px 0 0"></pre></div>
     <div class="box" style="margin-top:10px"><h3>802.15.4 sniffer (xG24 RCP)</h3><div id="tstatus"></div>
       <div class="sub" id="hopInfo" style="margin-top:4px"></div>
       <div class="sub" style="margin-top:4px">Channel / hop list / dwell are launcher options (restart): <code>python -m sniff_sight --channel 20</code> or <code>--hop 15,20 --dwell 2</code>. Frames with bad FCS are dropped inside the RCP; losses show up as frame-counter gaps and unmatched RF bursts.</div></div>
@@ -1371,6 +1438,54 @@ HTML = r"""
         btn.disabled = false;
       }
     };
+    // ---- system topology (Settings)
+    let topoEdited = false;
+    const ageTxt = (a) => a == null ? 'never seen' : a < 1.5 ? 'now' : a < 120 ? `${a.toFixed(0)} s ago` : `${(a / 60).toFixed(0)} min ago`;
+    const tnode = (on, cls, title, sub) => `<div class="tn ${cls} ${on ? 'on' : ''}"><b>${esc(title)}</b><small>${esc(sub)}</small></div>`;
+    function topoFill(nodes) {
+      $('topoEdit').innerHTML = nodes.map(n => `<div class="ctl"><span class="sub" style="min-width:3rem">TX ${esc(n.id)}</span><input data-k="name" data-id="${esc(n.id)}" value="${esc(n.name)}" style="flex:1;min-width:9rem"><input data-k="addrs" data-id="${esc(n.id)}" value="${esc(n.addrs)}" placeholder="source address(es), comma separated" style="flex:2;min-width:12rem"></div>`).join('');
+    }
+    function topoRender(t) {
+      const tx = t.nodes.map(n => tnode(n.active, 'tx', n.name || ('TX ' + n.id), `${n.addrs || 'no address set'} | ${ageTxt(n.last_age)}${n.count ? ' | ' + n.count + ' frames' : ''}`)).join('');
+      const oth = t.others.length ? `<div class="sub">Other sources: ${t.others.map(o => esc(o.src) + ' (' + ageTxt(o.last_age) + ')').join(', ')}</div>` : '';
+      const s = t.sdr, f = t.sniffer;
+      $('topo').innerHTML = `<div class="tcol"><div class="sub">Test network (TX)</div>${tx}${oth}</div>` +
+        `<div class="tarrow">&rarr;<small>air: ch ${esc(f.channel)} (${esc(f.channel_mhz)} MHz)</small></div>` +
+        `<div class="tcol"><div class="sub">Receivers</div>` +
+        tnode(s.active, 'rx', `RX: ESP-SDR S3 (${s.port})`, `${s.state || '-'} | ${s.bins} bins @ ${(+s.center_mhz).toFixed(1)} MHz | last spectrum ${ageTxt(s.last_age)}`) +
+        tnode(f.active, 'rx', `Sniffer SoC: xG24 RCP (${f.port})`, `${f.enabled ? (f.running ? 'running' : 'stopped') : 'disabled'} | last frame ${ageTxt(f.last_age)} | ${f.total} frames`) + `</div>` +
+        `<div class="tarrow">&rarr;</div><div class="tcol"><div class="sub">Dashboard</div>${tnode(true, 'dash', 'Sniff-Sight', t.clients + ' browser(s) connected')}</div>`;
+      if (!topoEdited) topoFill(t.nodes);
+    }
+    async function topoLoad() { try { const r = await fetch('/api/topology', { cache: 'no-cache' }); if (r.ok) topoRender(await r.json()); } catch (e) {} }
+    $('topoEdit').addEventListener('input', () => { topoEdited = true; });
+    $('topoSave').onclick = async () => {
+      const m = {};
+      for (const e of $('topoEdit').querySelectorAll('input')) { const id = +e.dataset.id; (m[id] = m[id] || { id })[e.dataset.k] = e.value.trim(); }
+      const r = await fetch('/api/topology/nodes', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(Object.values(m)) }).catch(() => null);
+      $('topoMsg').textContent = r && r.ok ? 'saved' : 'save failed'; topoEdited = false; topoLoad();
+    };
+    topoLoad(); setInterval(() => { if (tab === 'set') topoLoad(); }, 2000);
+    // ---- Silicon Labs kits via Simplicity Commander (backend); the flash button stays hidden unless enabled on the server
+    async function slLoad() {
+      try {
+        const j = await (await fetch('/api/silabs/info', { cache: 'no-cache' })).json();
+        $('slInfo').textContent = j.commander ? `Simplicity Commander ${j.version || ''} | images from ${j.fw_dir} (${j.files.length})${j.flash_enabled ? '' : ' | flashing disabled (not approved yet)'}${j.error ? ' | ' + j.error : ''}` : (j.error || 'Simplicity Commander not found');
+        $('slKit').innerHTML = j.adapters.map(a => `<option value="${esc(a.serial)}">${esc(a.serial)}: ${esc(a.boards.join(' + ') || a.name)}</option>`).join('') || '<option value="">no kit</option>';
+        $('slFile').innerHTML = j.files.map(f => `<option>${esc(f)}</option>`).join('') || '<option value="">no .s37/.hex/.bin</option>';
+        $('slFlash').style.display = j.flash_enabled ? '' : 'none';
+      } catch (e) { $('slInfo').textContent = 'Commander info failed'; }
+    }
+    $('slRefresh').onclick = slLoad;
+    $('slFlash').onclick = async () => {
+      if (!$('slKit').value || !$('slFile').value || !confirm(`Flash ${$('slFile').value} to kit ${$('slKit').value}? The sniffer stops during flashing.`)) return;
+      $('slLog').textContent = 'Flashing...';
+      const r = await fetch('/api/silabs/flash', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ file: $('slFile').value, serial: $('slKit').value }) });
+      const j = await r.json().catch(() => ({})); $('slLog').textContent = (j.ok ? 'OK' : 'FAILED') + ' ' + (j.error || j.output || '');
+    };
+    let slDone = false;
+    const slOnTab = () => { if (tab === 'set' && !slDone) { slDone = true; slLoad(); } };
+    setInterval(slOnTab, 1000);
     connect();
     showTab(localStorage.getItem('ss-tab') || 'live');
     window.addEventListener('resize', () => { if (tab === 'per' && perSel) loadRun(perSel); });
@@ -1507,6 +1622,131 @@ async def fw_reconnect():
     return {"ok": True}
 
 
+# ---- system topology (Settings): TX nodes -> air -> RX (SDR) + sniffer -> dashboard
+ACTIVE_S = 30.0
+NODES_FILE = os.environ.get("SNIFF_NODES_FILE") or os.path.join(os.environ.get("SNIFF_CAPTURES", DEFAULT_CAPTURES), "nodes.json")
+DEFAULT_NODES = [{"id": 1, "name": "TX 1 - ESP32-C6 Thread leader (COM8)", "addrs": "f2:a8:1f:ff:65:d5:19:86"}] + \
+    [{"id": i, "name": f"TX {i}", "addrs": ""} for i in range(2, 6)]
+
+
+def _load_nodes():
+    try:
+        with open(NODES_FILE, encoding="utf-8") as f:
+            nodes = json.load(f)
+        if isinstance(nodes, list) and nodes:
+            return nodes
+    except Exception:
+        pass
+    return [dict(n) for n in DEFAULT_NODES]
+
+
+def _addrs(s):
+    return [a.lower() for a in re.split(r"[,;\s]+", str(s or "")) if a]
+
+
+@app.get("/api/topology")
+async def api_topology():
+    """Activity is inferred from data only: SDR frames, sniffer frames, packet source
+    addresses (the node serial ports, e.g. the leader on COM8, are never opened)."""
+    now = time.time()
+    age = lambda t: round(now - t, 1) if t else None
+    seen, nodes, assigned = pkts.src_seen, [], set()
+    for n in _load_nodes():
+        a = _addrs(n.get("addrs"))
+        assigned.update(a)
+        last = max((seen[x][0] for x in a if x in seen), default=0.0)
+        nodes.append({"id": n.get("id"), "name": n.get("name", ""), "addrs": n.get("addrs", ""), "last_age": age(last),
+                      "count": sum(seen[x][1] for x in a if x in seen), "active": bool(last) and now - last < ACTIVE_S})
+    others = sorted(((s, v) for s, v in seen.items() if s not in assigned), key=lambda kv: -kv[1][0])[:8]
+    st = pkts.sniffer.status() if pkts.sniffer else {}
+    ch = pkts.sniffer.current_channel if pkts.sniffer else pkts.channel
+    running = bool((st.get("running") or {}).get("sniffer")) if isinstance(st.get("running"), dict) else bool(st.get("running"))
+    return {
+        "sdr": {"port": PORT, "state": hub.status.get("state"), "last_age": age(hub.last_frame_t),
+                "active": hub.status.get("state") == "streaming" and bool(hub.last_frame_t) and now - hub.last_frame_t < 3,
+                "bins": hub.settings.get("bins"), "center_mhz": hub.settings.get("freq_hz", 0) / 1e6},
+        "sniffer": {"port": os.environ.get("SNIFF_THREAD_PORT", "COM16"), "enabled": pkts.enabled, "running": running,
+                    "channel": ch, "channel_mhz": channel_mhz(ch), "last_age": age(pkts.last_pkt_t),
+                    "active": running and bool(pkts.last_pkt_t) and now - pkts.last_pkt_t < ACTIVE_S, "total": pkts.total},
+        "nodes": nodes, "others": [{"src": s, "last_age": age(v[0]), "count": v[1]} for s, v in others],
+        "clients": len(hub.clients), "active_s": ACTIVE_S}
+
+
+@app.post("/api/topology/nodes")
+async def api_topology_nodes(body: list = Body(...)):
+    out = []
+    for i, n in enumerate(body[:12]):
+        if not isinstance(n, dict):
+            continue
+        out.append({"id": int(n.get("id") or i + 1), "name": str(n.get("name", ""))[:60], "addrs": str(n.get("addrs", ""))[:200]})
+    os.makedirs(os.path.dirname(NODES_FILE) or ".", exist_ok=True)
+    with open(NODES_FILE, "w", encoding="utf-8") as f:
+        json.dump(out, f, indent=1)
+    return {"ok": True, "nodes": out}
+
+
+# ---- Silicon Labs boards (WSTK + BRD4187C xG24 RCP) via Simplicity Commander, flashing gated
+COMMANDER = os.environ.get("SNIFF_COMMANDER") or next((p for p in (
+    r"C:\SiliconLabs\SimplicityStudio\v5\developer\adapter_packs\commander\commander.exe",
+    r"C:\Program Files\SiliconLabs\Simplicity Commander\commander.exe",
+    r"C:\Program Files (x86)\SiliconLabs\Simplicity Commander\commander.exe") if os.path.isfile(p)), None)
+SILABS_FW_DIR = os.environ.get("SNIFF_SILABS_FW_DIR") or os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "silabs_fw")
+SILABS_FLASH_ENABLED = os.environ.get("SNIFF_SILABS_FLASH") == "1"   # off until the user approves flashing from the UI
+SILABS_EXT = (".s37", ".hex", ".bin")
+
+
+def _commander(args, timeout=30):
+    r = subprocess.run([COMMANDER] + args, capture_output=True, text=True, timeout=timeout,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    return r.returncode, r.stdout + r.stderr
+
+
+@app.get("/api/silabs/info")
+async def silabs_info():
+    """Read-only: Commander path/version, connected kits (commander adapter list --json), firmware files."""
+    res = {"commander": COMMANDER, "flash_enabled": SILABS_FLASH_ENABLED, "fw_dir": SILABS_FW_DIR, "files": [], "adapters": [], "error": None}
+    try:
+        res["files"] = sorted(f for f in os.listdir(SILABS_FW_DIR) if f.lower().endswith(SILABS_EXT))
+    except OSError:
+        pass
+    if not COMMANDER:
+        res["error"] = "Simplicity Commander not found (set SNIFF_COMMANDER)"
+        return res
+    loop = asyncio.get_running_loop()
+    try:
+        rc, out = await loop.run_in_executor(None, _commander, ["--version"], 15)
+        m = re.search(r"Simplicity Commander (\S+)", out)
+        res["version"] = m.group(1) if m else None
+        rc, out = await loop.run_in_executor(None, _commander, ["adapter", "list", "--json"], 20)
+        j = json.loads(out[out.index("{"): out.rindex("}") + 1])
+        for d in (j.get("result") or {}).get("devices", []):
+            res["adapters"].append({"serial": d.get("serial_number"), "name": d.get("adapter_name"), "label": d.get("adapter_label"),
+                                    "boards": [f'{b.get("board_name")} - {b.get("board_description")}' for b in d.get("boards", [])]})
+    except Exception as e:
+        res["error"] = f"{type(e).__name__}: {e}"
+    return res
+
+
+@app.post("/api/silabs/flash")
+async def silabs_flash(body: dict):
+    """commander flash <file> --serialno <sn>. Disabled unless SNIFF_SILABS_FLASH=1. Stops the
+    COM16 sniffer first (the RCP is reset by flashing) and restarts it afterwards."""
+    if not SILABS_FLASH_ENABLED:
+        return JSONResponse({"ok": False, "error": "Flashing Silicon Labs boards is disabled (needs approval; start with SNIFF_SILABS_FLASH=1)"}, status_code=403)
+    if not COMMANDER:
+        return JSONResponse({"ok": False, "error": "Simplicity Commander not found"}, status_code=400)
+    name, sn = os.path.basename(str(body.get("file", ""))), str(body.get("serial", ""))
+    path = os.path.join(SILABS_FW_DIR, name)
+    if not name.lower().endswith(SILABS_EXT) or not os.path.isfile(path) or not sn.isdigit():
+        return JSONResponse({"ok": False, "error": "bad file or serial number"}, status_code=400)
+    await pkts.shutdown()
+    try:
+        rc, out = await asyncio.get_running_loop().run_in_executor(None, _commander, ["flash", path, "--serialno", sn], 180)
+    finally:
+        await pkts.start()
+    return {"ok": rc == 0, "output": out[-4000:]}
+
+
 @app.get("/api/info")
 async def api_info():
     return {"status": hub.status, "thread": pkts.info(), "settings": hub._pub(hub.settings),
@@ -1543,6 +1783,7 @@ async def websocket_endpoint(ws: WebSocket):
         hub.clients.discard(ws)
         hub.lite.discard(ws)
         hub.lite_pts.pop(ws, None)
+        hub.drop_client(ws)
 
 
 # optional login (SNIFF_AUTH="user:pass"), covers every route incl. /ws and /api
