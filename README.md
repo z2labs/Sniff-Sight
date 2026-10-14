@@ -153,6 +153,20 @@ Over https or from another host the page uses the **Light** stream automatically
 
 More detail: [packet/RF pairing](#packet--rf-burst-pairing-details), [docs/BURST_CLASSES.md](docs/BURST_CLASSES.md), [tools/traffic/TEST_PLAN.md](tools/traffic/TEST_PLAN.md).
 
+## Custom testbenches & RF benchmarking
+
+The free edition supports **2 test (TX) nodes**. Larger and more complex testbenches (up to 5 and more TX nodes, scheduled
+Teacher-network lessons with automatic burst labelling, classifier evaluation and retraining) are available as
+**Pro features and custom consulting**.
+
+We welcome requests to build more complex testbenches, drawing on 20 years of experience in RF benchmarking:
+multi-vendor radio performance comparisons, receiver sensitivity and immunity, transmitter emission masks, static and dynamic
+current consumption, and self-contained conducted link-budget test setups.
+
+- Article: [Radio performance benchmarking](https://blog.z2labs.io/article/radio-performance-benchmarking) (a compact conducted test environment)
+- Video: [Linquisitor demo (YouTube)](https://www.youtube.com/watch?v=lf_YzTGfvR8)
+- Contact: hello [at] z2labs [dot] io
+
 ## Roadmap
 
 - Custom RCP build that forwards frames with bad FCS (true CRC-error capture)

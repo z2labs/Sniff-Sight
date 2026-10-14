@@ -37,6 +37,7 @@ from .thread_sniffer import ThreadSniffer, channel_mhz
 from . import rfpair
 from .per import PerTracker
 from .bursts import BurstEngine
+from . import features
 
 PORT = os.environ.get("SNIFF_PORT", "COM7")
 BAUD = int(os.environ.get("SNIFF_BAUD", "115200"))
@@ -832,6 +833,7 @@ HTML = r"""
       <details style="margin-top:8px"><summary class="sub">Test nodes: names and 802.15.4 source addresses</summary><div id="topoEdit"></div>
         <div class="ctl"><button id="topoSave">Save</button> <span id="topoMsg" class="sub"></span></div></details>
       <div class="sub" style="margin-top:4px">Bright = active (data in the last 30 s: SDR spectra, sniffer frames, node seen as a packet source). Nodes are recognised from sniffed packets only; their serial ports are never opened.</div></div>
+<!--TEACHER-->
     <div class="box"><h3>Spectrum (ESP32-S3)</h3><div class="sub">The RF controls (centre, span, bins, gain, detector, averaging, range, stream mode) are on the Live tab, above the plot (on a phone: under the plot).</div><div id="status">Connecting...</div></div>
     <div class="box" style="margin-top:10px"><h3>Firmware (ESP32-S3 SDR)</h3>
       <div class="sub">Board: <b id="fwBoard">-</b><br>Bundled: <b id="fwBundled">-</b> <span id="fwCmp"></span></div>
@@ -1495,7 +1497,8 @@ HTML = r"""
       $('topoEdit').innerHTML = nodes.map(n => `<div class="ctl"><span class="sub" style="min-width:3rem">TX ${esc(n.id)}</span><input data-k="name" data-id="${esc(n.id)}" value="${esc(n.name)}" style="flex:1;min-width:9rem"><input data-k="addrs" data-id="${esc(n.id)}" value="${esc(n.addrs)}" placeholder="source address(es), comma separated" style="flex:2;min-width:12rem"></div>`).join('');
     }
     function topoRender(t) {
-      const tx = t.nodes.map(n => tnode(n.active, 'tx', n.name || ('TX ' + n.id), `${n.addrs || 'no address set'} | ${ageTxt(n.last_age)}${n.count ? ' | ' + n.count + ' frames' : ''}`)).join('');
+      const tx = t.nodes.slice(0, 2).map(n => tnode(n.active, 'tx', n.name || ('TX ' + n.id), `${n.addrs || 'no address set'} | ${ageTxt(n.last_age)}${n.count ? ' | ' + n.count + ' frames' : ''}`)).join('') +
+        `<div class="tn tx" style="opacity:.35" title="Pro / consulting"><b>TX 3-5</b><small>up to 5 nodes: Pro / consulting &mdash; hello [at] z2labs [dot] io</small></div>`;
       const oth = t.others.length ? `<div class="sub">Other sources: ${t.others.map(o => esc(o.src) + ' (' + ageTxt(o.last_age) + ')').join(', ')}</div>` : '';
       const s = t.sdr, f = t.sniffer;
       $('topo').innerHTML = `<div class="tcol"><div class="sub">Test network (TX)</div>${tx}${oth}</div>` +
@@ -1552,6 +1555,9 @@ DEMO_TAGS = '<script>window.SS_DEMO_SAMPLE = "/demo/sample.json";</script>\n  <s
 def demo_html(tags: str = DEMO_TAGS) -> str:
     """Dashboard HTML with the canned-data player injected (it replaces /ws and /api/* in the browser)."""
     return HTML.replace('<script src="/static/flasher.js">', tags + '<script src="/static/flasher.js">', 1)
+
+
+HTML = HTML.replace("<!--TEACHER-->", features.settings_html())   # free edition: greyed Pro teaser
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1675,7 +1681,7 @@ async def fw_reconnect():
 ACTIVE_S = 30.0
 NODES_FILE = os.environ.get("SNIFF_NODES_FILE") or os.path.join(os.environ.get("SNIFF_CAPTURES", DEFAULT_CAPTURES), "nodes.json")
 DEFAULT_NODES = [{"id": 1, "name": "TX 1 - ESP32-C6 Thread leader (COM8)", "addrs": "f2:a8:1f:ff:65:d5:19:86"}] + \
-    [{"id": i, "name": f"TX {i}", "addrs": ""} for i in range(2, 6)]
+    [{"id": i, "name": f"TX {i}", "addrs": ""} for i in range(2, 3)]   # free edition: 2 TX nodes (TX 3-5: Pro / consulting)
 
 
 def _load_nodes():
