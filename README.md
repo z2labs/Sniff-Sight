@@ -164,7 +164,9 @@ multi-vendor radio performance comparisons, receiver sensitivity and immunity, t
 current consumption, and self-contained conducted link-budget test setups.
 
 - Article: [Radio performance benchmarking](https://blog.z2labs.io/article/radio-performance-benchmarking) (a compact conducted test environment)
-- Video: [Linquisitor demo (YouTube)](https://www.youtube.com/watch?v=lf_YzTGfvR8)
+- Video: Linquisitor demo (YouTube)
+
+  [![Linquisitor demo — watch on YouTube](docs/img/linquisitor_teaser.jpg)](https://www.youtube.com/watch?v=lf_YzTGfvR8)
 - Contact: hello [at] z2labs [dot] io
 
 ## Roadmap
