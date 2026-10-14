@@ -11,6 +11,10 @@ HTML = r"""
       <div class="sub">Per-protocol accuracy, precision/recall, confusion matrix and confidence calibration against Teacher labels;
         retrain on Teacher-labelled data, compare and activate versioned models.</div>
       <div class="ctl" style="margin-top:6px"><button disabled>Evaluate</button> <button disabled>Retrain</button> <button disabled>Activate model</button></div>
+      <h3 style="margin-top:10px">Timing calibration &mdash; Pro feature &mdash; contact hello [at] z2labs [dot] io</h3>
+      <div class="sub">Measures serial-marker, sniffer and SDR timing offsets and jitter with a known on/off RF pattern from the Teacher nodes
+        and corrects packet &harr; burst pairing.</div>
+      <div class="ctl" style="margin-top:6px"><button disabled>Run calibration</button> <label><input type="checkbox" disabled> Apply timing correction</label></div>
       <div class="sub" style="margin-top:6px"><b>Pro feature &mdash; contact hello [at] z2labs [dot] io</b></div>
     </div>
 """
