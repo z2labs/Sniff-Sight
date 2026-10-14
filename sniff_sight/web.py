@@ -89,6 +89,7 @@ class SpectrumHub:
         self._release_timer = None
         self.last_frame_t = 0.0
         self.outq = {}                  # ws -> [latest msg, kind, Event, sender task]
+        self.full_acc = None            # [sum of linear power, max dB, frames] since the last full push
 
     def _on_burst(self, rec):          # bursts thread
         if self.loop:
@@ -260,6 +261,7 @@ class SpectrumHub:
     async def _pump(self, s):
         period = 1.0 / PUSH_HZ
         last_push = 0.0
+        self.full_acc = None
         last_seq = None
         gaps = 0
         t_rate, f_rate, rate = time.monotonic(), 0, 0.0
@@ -312,17 +314,36 @@ class SpectrumHub:
                             cache[k] = self._binmsg(dict(meta, n=int(q.size)), q.tobytes())
                         self._offer(ws, cache[k], "lite")
             full = [ws for ws in self.clients if ws not in self.lite]
-            if full and now >= last_push:   # newest spectrum; the page averages. Tick schedule (not "now + period"):
-                last_push = max(last_push + period, now - period)   # frames arrive in USB/poll clumps, this keeps the mean rate
+            if full:
+                # The S3 delivers ~110 (4096 bins) / ~220 (2048) frames/s but each covers only ~6-8 % of the
+                # air time (FFT-throughput bound, ~1200 FFT/s at 4096). Pushing only the newest frame at 60/s
+                # threw away ~half of them, so a burst was in one row and missing in the next (striping).
+                # Every frame now goes into the push: power mean for the trace, max for the waterfall.
+                fa = self.full_acc
+                if fa is None or fa[0].size != db_np.size:
+                    fa = self.full_acc = [np.zeros(db_np.size, np.float64), np.full(db_np.size, -200.0, np.float32), 0, 0]
+                fa[0] += np.power(10.0, db_np / 10.0)
+                np.maximum(fa[1], db_np, out=fa[1])
+                fa[2] += 1
+                fa[3] += sp.ffts
+            # Push after a FIXED number of device frames (not on a wall-clock tick): frames arrive from USB in
+            # clumps of 1-4, so tick-based pushes held 1..4 frames each and rows differed in averaging/peak
+            # depth (row-to-row brightness jumps). fpp ~= device rate / PUSH_HZ (2 at 4096 bins, 4 at 2048).
+            fpp = max(1, int(round(rate / PUSH_HZ))) if rate > 0 else 1
+            if full and self.full_acc is not None and self.full_acc[2] >= fpp and now - last_push >= 0.5 * period:
+                last_push = now
+                fa, self.full_acc = self.full_acc, None
+                mean_db = (10.0 * np.log10(fa[0] / fa[2])).astype(np.float32)
+                max_db = fa[1]
                 meta = {"type": "spec", "seq": sp.sequence, "gain": sp.gain, "drops": sp.drops,
                         "ffts": sp.ffts, "frame_ms": round(sp.spanned / s["span"] * 1e3, 3), "fps": round(rate, 1), "gaps": gaps,
                         "crc_errors": self.sdr.crc_errors, "center_hz": self.sdr.spec_center_hz,
-                        "span_hz": s["span"], "clock": self.clock.info(), "t": t1}
+                        "span_hz": s["span"], "clock": self.clock.info(), "t": t1, "frames": fa[2], "ffts_sum": fa[3]}
                 if WS_JSON:
-                    msg = json.dumps(dict(meta, db=np.round(db_np, 1).tolist()))
+                    msg = json.dumps(dict(meta, db=np.round(mean_db, 1).tolist(), wf=np.round(max_db, 1).tolist()))
                 else:
-                    q = np.clip(np.rint((db_np + 140.0) * 100), 0, 65535).astype("<u2")   # 0.01 dB steps
-                    msg = self._binmsg(dict(meta, enc="u16", n=int(q.size)), q.tobytes())
+                    q = np.clip(np.rint((np.concatenate((mean_db, max_db)) + 140.0) * 100), 0, 65535).astype("<u2")   # 0.01 dB steps
+                    msg = self._binmsg(dict(meta, enc="u16", n=int(mean_db.size), wf=1), q.tobytes())
                 for ws in full:
                     self._offer(ws, msg, "full")
             t_wait = time.perf_counter(); pf["push_ms"] += (t_wait - _t1) * 1e3
@@ -768,7 +789,7 @@ HTML = r"""
     <div id="readout" class="ro"></div>
     <canvas id="waterfall" height="300"></canvas>
     </div>
-    <div class="legend"><label><input id="bov" type="checkbox" checked> burst overlay</label>
+    <div class="legend"><label><input id="bov" type="checkbox" checked> burst overlay</label> <label title="Waterfall detector: Peak = maximum of all device frames in a row (SA style, bursts stay visible); Mean = power average">WF <select id="wfDet"><option value="peak">peak</option><option value="mean">mean</option></select></label> <label title="Waterfall row time (all device frames in it are combined)">row <select id="wfRow"><option value="17">17 ms</option><option value="33" selected>33 ms</option><option value="67">67 ms</option></select></label>
       <span class="c-ieee802154">&#9632; 802.15.4</span><span class="c-ble">&#9632; BLE</span><span class="c-wifi">&#9632; Wi-Fi</span><span class="c-microwave_oven">&#9632; microwave</span><span class="c-unknown">&#9632; unknown</span><span class="sub" id="bLegendStats"></span></div>
     <div class="row2">
       <div class="box"><h3>802.15.4 packets</h3><div id="pktwrap"><table>
@@ -929,9 +950,15 @@ HTML = r"""
       shiftWaterfall();
       wx.drawImage(wc, 0, 0, wc.width, wc.height - 1, 0, 1, wc.width, wc.height - 1);
       const row = wx.createImageData(wc.width, 1);
+      if (wfMin === null) { wfMin = dbMin; wfMax = dbMax; }
+      const k = n / m.span_hz;
       for (let x = 0; x < wc.width; x++) {
-        const i = Math.floor((hzOfX(x) - dataF0) / m.span_hz * n);
-        const c = (x < L || i < 0 || i >= n) ? [0, 0, 0] : heat((db[i] - dbMin) / (dbMax - dbMin));
+        // every bin the pixel covers (max), not one sampled bin: at 4096 bins on ~1000 px the
+        // point sampling picked an arbitrary 1-of-4 noisy bin per row -> speckle that reads as streaks
+        const i0 = Math.floor((hzOfX(x) - dataF0) * k), i1 = Math.max(i0 + 1, Math.floor((hzOfX(x + 1) - dataF0) * k));
+        let v = -Infinity;
+        for (let i = Math.max(0, i0); i < Math.min(n, i1); i++) if (db[i] > v) v = db[i];
+        const c = (x < L || v === -Infinity) ? [0, 0, 0] : heat((v - wfMin) / (wfMax - wfMin));
         row.data.set([c[0], c[1], c[2], 255], x * 4);
       }
       wx.putImageData(row, 0, 0);
@@ -950,8 +977,10 @@ HTML = r"""
       let y0 = rowTimes.findIndex(t => t <= b.t1), y1 = rowTimes.findIndex(t => t <= b.t0);
       if (y0 < 0) return; if (y1 < 0) y1 = rowTimes.length; if (y1 <= y0) y1 = y0 + 1;
       const xa = xOfHz(b.f_lo_mhz * 1e6), xb = xOfHz(b.f_hi_mhz * 1e6); if (xb < L || xa > wc.width) return;
-      wx.strokeStyle = BCOL[b.cls] || '#aaa'; wx.globalAlpha = 0.35 + 0.6 * (b.confidence || 0); wx.lineWidth = 1;
-      wx.strokeRect(Math.max(L, xa) - 1.5, y0 - 0.5, Math.max(3, xb - xa) + 3, Math.max(2, y1 - y0) + 1); wx.globalAlpha = 1;
+      // subtle: two short vertical edge marks at the burst's band edges, no horizontal top/bottom lines
+      // (those read as stripes across the waterfall, mostly at 4096 bins where more bursts are found)
+      wx.fillStyle = BCOL[b.cls] || '#aaa'; wx.globalAlpha = 0.25 + 0.35 * (b.confidence || 0);
+      const h = Math.max(2, y1 - y0); wx.fillRect(Math.max(L, xa) - 1, y0, 1, h); wx.fillRect(Math.min(wc.width - 1, xb), y0, 1, h); wx.globalAlpha = 1;
     }
     function onSpec(m) {
       last = m; deviceHz = m.center_hz;
@@ -966,13 +995,32 @@ HTML = r"""
       if (!$('auto').checked) { dbMax = +$('ref').value; dbMin = dbMax - 10 * +$('div').value; }
       else if (true) {
         const s = Array.from(avg).filter(v => v > -139).sort((x, y) => x - y);
-        if (s.length) { const lo = s[Math.floor(s.length * 0.05)] - 8, hi = s[s.length - 1] + 6;
+        if (s.length) { const lo = s[Math.floor(s.length * 0.05)] - 8, hi = s[Math.floor(s.length * 0.998)] + 6;   // robust top: one hot bin must not move the scale
           dbMin += 0.1 * (lo - dbMin); dbMax += 0.1 * (Math.max(hi, lo + 20) - dbMax); }
       }
-      rowQ.push(m); if (rowQ.length > 64) rowQ.shift();
+      if (wfMin === null || !$('auto').checked) { wfMin = dbMin; wfMax = dbMax; }
+      else { wfMin += 0.01 * (dbMin - wfMin); wfMax += 0.01 * (dbMax - wfMax); }   // ~2 s time constant at 60 rows/s
+      wfFeed(m);
       if (!rafOn) { rafOn = true; requestAnimationFrame(drawFrame); }
     }
-    let rowQ = [], rafOn = false, drawT = [], drawFps = 0;
+    let rowQ = [], rafOn = false, drawT = [], drawFps = 0, wfMin = null, wfMax = null, wfAcc = null;
+    // Waterfall detector like a swept SA: Peak = max of every device frame in the row time (bursts stay
+    // visible, no row-to-row flicker from the ~6 % air-time coverage per frame); Mean = power average.
+    function wfFeed(m) {
+      const peakMode = $('wfDet').value !== 'mean', src = peakMode && m.wf ? m.wf : m.db, n = src.length;
+      const key = n + '/' + m.center_hz + '/' + m.span_hz, now = performance.now();
+      if (wfAcc && wfAcc.key !== key) wfFlush();
+      if (!wfAcc) wfAcc = { key, peak: peakMode, v: peakMode ? Float32Array.from(src) : Float32Array.from(src, x => Math.pow(10, x / 10)), k: 1, t0: now, m };
+      else { const v = wfAcc.v; if (wfAcc.peak) { for (let i = 0; i < n; i++) if (src[i] > v[i]) v[i] = src[i]; } else for (let i = 0; i < n; i++) v[i] += Math.pow(10, src[i] / 10); wfAcc.k++; wfAcc.m = m; }
+      wfAcc.f = (wfAcc.f || 0) + (m.frames || 1);   // rows hold a fixed number of device frames (uniform depth)
+      const target = m.fps > 0 && m.frames ? Math.max(1, Math.round(+$('wfRow').value * m.fps / 1000)) : 0;
+      if (target ? wfAcc.f >= target : now - wfAcc.t0 >= +$('wfRow').value - 4) wfFlush();
+    }
+    function wfFlush() {
+      const a = wfAcc; wfAcc = null; if (!a) return;
+      const db = a.peak ? a.v : Float32Array.from(a.v, x => 10 * Math.log10(x / a.k));
+      rowQ.push(Object.assign({}, a.m, { db })); if (rowQ.length > 64) rowQ.shift();
+    }
     function drawFrame() {
       rafOn = false; const q = rowQ; rowQ = [];
       for (const m of q) addRow(m);
@@ -1371,6 +1419,7 @@ HTML = r"""
       const ml = new DataView(buf).getUint32(0, true), m = JSON.parse(tdec.decode(new Uint8Array(buf, 4, ml))), off = 4 + ml;
       const q = m.enc === 'u16' ? new Uint16Array(buf, off, m.n) : new Uint8Array(buf, off, m.n), sc_ = m.enc === 'u16' ? 0.01 : 0.5;
       const db = new Float32Array(m.n); for (let i = 0; i < m.n; i++) db[i] = q[i] * sc_ - 140;
+      if (m.wf && m.enc === 'u16') { const w = new Uint16Array(buf, off + 2 * m.n, m.n), wf = new Float32Array(m.n); for (let i = 0; i < m.n; i++) wf[i] = w[i] * 0.01 - 140; m.wf = wf; } else m.wf = null;
       m.db = db; return m;
     }
     function connect() {
